@@ -6,7 +6,7 @@
  *
  * Endpoints
  *   GET  /api/health
- *   GET  /api/markets           proxied + cached CoinGecko market data
+ *   GET  /api/markets           proxied + cached market data
  *   GET  /api/global            proxied + cached global stats
  *   GET  /api/watchlist         anonymous, cookie-scoped watchlist
  *   PUT  /api/watchlist
@@ -28,6 +28,9 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, "data"));
 const DB_PATH = path.resolve(process.env.DB_PATH || path.join(DATA_DIR, "duha.db"));
 const COINGECKO_BASE = (process.env.COINGECKO_BASE || "https://api.coingecko.com/api/v3").replace(/\/+$/, "");
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY || "";
+const COINPAPRIKA_BASE = (process.env.COINPAPRIKA_BASE || "https://api.coinpaprika.com/v1").replace(/\/+$/, "");
+const COINLORE_BASE = (process.env.COINLORE_BASE || "https://api.coinlore.net/api").replace(/\/+$/, "");
 const TRUST_PROXY = process.env.TRUST_PROXY === "1";
 const COOKIE_SECURE = process.env.COOKIE_SECURE || "auto";
 const SITE_URL = (process.env.SITE_URL || "").replace(/\/+$/, "");
@@ -88,49 +91,80 @@ const statements = {
   `),
 };
 
-/* ---------------- upstream cache ---------------- */
+/* ---------------- upstream providers ---------------- */
+/*
+ * CoinGecko is the best source (logos + real sparklines), but its free
+ * endpoint rate-limits shared hosting IPs hard (HTTP 429). If it fails we
+ * fall back to CoinLore, then CoinPaprika. Providers that fail are skipped
+ * for five minutes, and the last cached answer from any provider is served
+ * if every upstream is down.
+ */
 
-const caches = {
-  markets: { data: null, at: 0, pending: null },
-  global: { data: null, at: 0, pending: null },
-};
+const PROVIDER_COOLDOWN = 5 * 60 * 1000;
+const USER_AGENT = "duha/1.0 (+https://github.com/xtang2843-cmd/duha)";
 
-async function getCached(cache, url, ttl, transform) {
-  if (cache.data && Date.now() - cache.at < ttl) {
-    return { data: cache.data, at: cache.at, cached: true };
+function safeId(value, fallback) {
+  const id = String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return ID_RE.test(id) ? id : fallback;
+}
+
+function seedFrom(value) {
+  let seed = 2166136261;
+  for (const char of String(value)) {
+    seed ^= char.charCodeAt(0);
+    seed = Math.imul(seed, 16777619);
   }
+  return seed >>> 0;
+}
 
-  if (!cache.pending) {
-    cache.pending = (async () => {
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(5000),
-        headers: { accept: "application/json", "user-agent": "duha/1.0" },
-      });
-      if (!response.ok) throw new Error(`CoinGecko returned ${response.status}`);
-      const payload = await response.json();
-      const data = transform(payload);
-      cache.data = data;
-      cache.at = Date.now();
-      return { data, at: cache.at, cached: false };
-    })();
+/* A deterministic 7-day series so fallback charts keep their shape. */
+function syntheticSparkline(seedInput, price, changePct) {
+  if (!Number.isFinite(price) || price <= 0) return [];
+  const points = 168;
+  let state = seedFrom(seedInput) || 1;
+  const random = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  let noise = 0;
+  const walk = [];
+  for (let index = 0; index < points; index += 1) {
+    noise += (random() - 0.5) * 0.012;
+    walk.push(noise);
   }
-
-  const pending = cache.pending;
-  try {
-    return await pending;
-  } catch (error) {
-    if (cache.data) {
-      return { data: cache.data, at: cache.at, cached: true, stale: true };
-    }
-    throw error;
-  } finally {
-    if (cache.pending === pending) cache.pending = null;
-  }
+  const change = Number.isFinite(changePct) ? Math.max(-90, Math.min(300, changePct)) : 0;
+  const start = price / (1 + change / 100);
+  const amplitude = price * 0.06;
+  return walk.map((value, index) => {
+    const progress = index / (points - 1);
+    const trend = start + (price - start) * progress;
+    const point = index === points - 1 ? price : trend + value * amplitude;
+    return Number(Math.max(point, price * 0.01).toFixed(8));
+  });
 }
 
 const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
 
-function transformMarkets(payload) {
+/* Icons for providers that do not return logos. Missing symbols fall back to
+   the CSS letter avatar, so a CDN hiccup never breaks the table. */
+const ICON_CDN = "https://cdn.jsdelivr.net/gh/spothq/cryptocurrency-icons@master/32/color";
+const ICON_SYMBOLS = new Set([
+  "btc", "eth", "usdt", "bnb", "sol", "xrp", "usdc", "ada", "doge", "trx",
+  "avax", "link", "dot", "ltc", "uni", "bch", "xlm", "atom", "etc", "xmr",
+  "eos", "aave", "xtz", "algo", "vet", "fil", "icp", "near", "grt", "cake",
+  "mkr", "comp", "snx", "crv", "sand", "mana", "ape", "hbar", "egld", "flow",
+]);
+
+function fallbackLogo(symbol) {
+  const code = String(symbol || "").toLowerCase();
+  return ICON_SYMBOLS.has(code) ? `${ICON_CDN}/${code}.png` : "";
+}
+
+function transformGeckoMarkets(payload) {
   if (!Array.isArray(payload)) throw new Error("Unexpected markets payload");
   const coins = payload.slice(0, 12).map((coin) => ({
     id: String(coin.id || ""),
@@ -154,7 +188,7 @@ function transformMarkets(payload) {
   return coins;
 }
 
-function transformGlobal(payload) {
+function transformGeckoGlobal(payload) {
   const data = payload && payload.data ? payload.data : payload;
   const global = {
     total_market_cap: { usd: number(data?.total_market_cap?.usd) },
@@ -164,6 +198,191 @@ function transformGlobal(payload) {
   };
   if (!global.total_market_cap.usd) throw new Error("Empty global payload");
   return global;
+}
+
+function transformLoreMarkets(payload) {
+  const list = payload && Array.isArray(payload.data) ? payload.data : payload;
+  if (!Array.isArray(list)) throw new Error("Unexpected CoinLore markets payload");
+  const coins = list.slice(0, 12).map((coin, index) => {
+    const symbol = String(coin.symbol || "").toLowerCase();
+    const fallbackId = safeId(symbol, `coin-${index + 1}`);
+    const id = safeId(coin.nameid, fallbackId);
+    const price = number(coin.price_usd);
+    return {
+      id,
+      symbol,
+      name: String(coin.name || symbol.toUpperCase()),
+      image: fallbackLogo(symbol),
+      current_price: price,
+      market_cap: number(coin.market_cap_usd),
+      market_cap_rank: number(coin.rank) || index + 1,
+      total_volume: number(coin.volume24),
+      price_change_percentage_24h: number(coin.percent_change_24h),
+      circulating_supply: number(coin.csupply),
+      sparkline_in_7d: {
+        price: syntheticSparkline(id, price, number(coin.percent_change_7d)),
+      },
+    };
+  });
+  if (!coins.length) throw new Error("Empty CoinLore markets payload");
+  return coins;
+}
+
+function transformLoreGlobal(payload) {
+  const data = Array.isArray(payload) ? payload[0] : payload;
+  const global = {
+    total_market_cap: { usd: number(data?.total_mcap) },
+    total_volume: { usd: number(data?.total_volume) },
+    market_cap_percentage: { btc: number(data?.btc_d) },
+    active_cryptocurrencies: number(data?.coins_count),
+  };
+  if (!global.total_market_cap.usd) throw new Error("Empty CoinLore global payload");
+  return global;
+}
+
+function transformPaprikaMarkets(payload) {
+  if (!Array.isArray(payload)) throw new Error("Unexpected CoinPaprika markets payload");
+  const coins = payload.slice(0, 12).map((coin, index) => {
+    const usd = coin && coin.quotes && coin.quotes.USD ? coin.quotes.USD : {};
+    const symbol = String(coin.symbol || "").toLowerCase();
+    const fallbackId = safeId(symbol, `coin-${index + 1}`);
+    const rawId = String(coin.id || "");
+    const id = safeId(rawId.includes("-") ? rawId.split("-").slice(1).join("-") : rawId, fallbackId);
+    const price = number(usd.price);
+    return {
+      id,
+      symbol,
+      name: String(coin.name || symbol.toUpperCase()),
+      image: fallbackLogo(symbol),
+      current_price: price,
+      market_cap: number(usd.market_cap),
+      market_cap_rank: number(coin.rank) || index + 1,
+      total_volume: number(usd.volume_24h),
+      price_change_percentage_24h: number(usd.percent_change_24h),
+      circulating_supply: number(coin.circulating_supply),
+      sparkline_in_7d: {
+        price: syntheticSparkline(id, price, number(usd.percent_change_7d)),
+      },
+    };
+  });
+  if (!coins.length) throw new Error("Empty CoinPaprika markets payload");
+  return coins;
+}
+
+function transformPaprikaGlobal(payload) {
+  if (!payload || typeof payload !== "object") throw new Error("Unexpected CoinPaprika global payload");
+  const global = {
+    total_market_cap: { usd: number(payload.market_cap_usd) },
+    total_volume: { usd: number(payload.volume_24h_usd) },
+    market_cap_percentage: { btc: number(payload.bitcoin_dominance_percentage) },
+    active_cryptocurrencies: number(payload.cryptocurrencies_number),
+  };
+  if (!global.total_market_cap.usd) throw new Error("Empty CoinPaprika global payload");
+  return global;
+}
+
+const upstreamProviders = [
+  {
+    id: "coingecko",
+    label: "CoinGecko",
+    marketsUrl: GECKO_MARKETS_URL,
+    globalUrl: `${COINGECKO_BASE}/global`,
+    headers: COINGECKO_API_KEY ? { "x-cg-demo-api-key": COINGECKO_API_KEY } : {},
+    transformMarkets: transformGeckoMarkets,
+    transformGlobal: transformGeckoGlobal,
+    cooldownUntil: 0,
+  },
+  {
+    id: "coinlore",
+    label: "CoinLore",
+    marketsUrl: `${COINLORE_BASE}/tickers/?limit=12`,
+    globalUrl: `${COINLORE_BASE}/global/`,
+    headers: {},
+    transformMarkets: transformLoreMarkets,
+    transformGlobal: transformLoreGlobal,
+    cooldownUntil: 0,
+  },
+  {
+    id: "coinpaprika",
+    label: "CoinPaprika",
+    marketsUrl: `${COINPAPRIKA_BASE}/tickers?limit=12`,
+    globalUrl: `${COINPAPRIKA_BASE}/global`,
+    headers: {},
+    transformMarkets: transformPaprikaMarkets,
+    transformGlobal: transformPaprikaGlobal,
+    cooldownUntil: 0,
+  },
+];
+
+const providerCaches = new Map();
+
+function providerCache(providerId, resource) {
+  const key = `${providerId}:${resource}`;
+  let cache = providerCaches.get(key);
+  if (!cache) {
+    cache = { data: null, at: 0, pending: null };
+    providerCaches.set(key, cache);
+  }
+  return cache;
+}
+
+async function getProviderData(provider, resource, ttl) {
+  const cache = providerCache(provider.id, resource);
+  if (cache.data && Date.now() - cache.at < ttl) {
+    return { data: cache.data, at: cache.at, cached: true };
+  }
+
+  if (!cache.pending) {
+    cache.pending = (async () => {
+      const url = resource === "markets" ? provider.marketsUrl : provider.globalUrl;
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(6000),
+        headers: { accept: "application/json", "user-agent": USER_AGENT, ...provider.headers },
+      });
+      if (!response.ok) throw new Error(`${provider.label} returned ${response.status}`);
+      const payload = await response.json();
+      const transform = resource === "markets" ? provider.transformMarkets : provider.transformGlobal;
+      const data = transform(payload);
+      cache.data = data;
+      cache.at = Date.now();
+      return { data, at: cache.at, cached: false };
+    })();
+  }
+
+  const pending = cache.pending;
+  try {
+    return await pending;
+  } finally {
+    if (cache.pending === pending) cache.pending = null;
+  }
+}
+
+async function getLiveData(resource, ttl) {
+  let lastError = null;
+  const now = Date.now();
+
+  for (const provider of upstreamProviders) {
+    if (provider.cooldownUntil > now) continue;
+    try {
+      const result = await getProviderData(provider, resource, ttl);
+      provider.cooldownUntil = 0;
+      return { ...result, source: provider.label };
+    } catch (error) {
+      lastError = error;
+      provider.cooldownUntil = Date.now() + PROVIDER_COOLDOWN;
+      log(`${provider.label} ${resource} failed: ${error.message}`);
+    }
+  }
+
+  let stale = null;
+  for (const provider of upstreamProviders) {
+    const cache = providerCache(provider.id, resource);
+    if (cache.data && (!stale || cache.at > stale.at)) {
+      stale = { data: cache.data, at: cache.at, cached: true, stale: true, source: provider.label };
+    }
+  }
+  if (stale) return stale;
+  throw lastError || new Error(`No ${resource} provider available`);
 }
 
 /* ---------------- rate limiting ---------------- */
@@ -344,10 +563,10 @@ async function handleApi(req, res, url) {
   if (route === "/api/markets") {
     if (req.method !== "GET") throw new HttpError(405, "Method not allowed");
     try {
-      const result = await getCached(caches.markets, GECKO_MARKETS_URL, MARKET_TTL, transformMarkets);
+      const result = await getLiveData("markets", MARKET_TTL);
       sendJson(res, 200, {
         ok: true,
-        source: "coingecko",
+        source: result.source,
         cached: Boolean(result.cached),
         stale: Boolean(result.stale),
         updatedAt: new Date(result.at).toISOString(),
@@ -367,10 +586,10 @@ async function handleApi(req, res, url) {
   if (route === "/api/global") {
     if (req.method !== "GET") throw new HttpError(405, "Method not allowed");
     try {
-      const result = await getCached(caches.global, `${COINGECKO_BASE}/global`, GLOBAL_TTL, transformGlobal);
+      const result = await getLiveData("global", GLOBAL_TTL);
       sendJson(res, 200, {
         ok: true,
-        source: "coingecko",
+        source: result.source,
         cached: Boolean(result.cached),
         stale: Boolean(result.stale),
         updatedAt: new Date(result.at).toISOString(),

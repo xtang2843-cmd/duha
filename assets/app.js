@@ -32,6 +32,7 @@
     coins: [],
     global: null,
     source: "connecting",
+    sourceName: "CoinGecko",
     lastUpdated: null,
     range: "7d",
     tab: "all",
@@ -506,10 +507,11 @@
     if (!el) return;
     if (state.source === "live") {
       el.className = "market-status live";
-      el.innerHTML = `<span class="status-dot"></span>Live · CoinGecko${state.lastUpdated ? " · " + timeShort(state.lastUpdated) : ""}`;
+      const provider = esc(state.sourceName || "CoinGecko");
+      el.innerHTML = `<span class="status-dot"></span>Live · ${provider}${state.lastUpdated ? " · " + timeShort(state.lastUpdated) : ""}`;
     } else if (state.source === "connecting") {
       el.className = "market-status pending";
-      el.innerHTML = `<span class="status-dot"></span>${state.lastUpdated ? "Refreshing market data…" : "Demo data · connecting to CoinGecko…"}`;
+      el.innerHTML = `<span class="status-dot"></span>${state.lastUpdated ? "Refreshing market data…" : "Demo data · connecting to live prices…"}`;
     } else {
       el.className = "market-status demo";
       el.innerHTML = `<span class="status-dot"></span>Demo data · live feed unavailable`;
@@ -546,23 +548,29 @@
       getJSON(marketsUrl),
       getJSON(globalUrl),
     ]);
+    const markets = results[0].status === "fulfilled" ? results[0].value : null;
     return {
-      coins: results[0].status === "fulfilled" ? normalizeCoins(extractCoins(results[0].value)) : [],
+      coins: markets ? normalizeCoins(extractCoins(markets)) : [],
       global: results[1].status === "fulfilled" ? extractGlobal(results[1].value) : null,
+      source: markets && typeof markets === "object" && typeof markets.source === "string"
+        ? markets.source
+        : "",
     };
   }
 
   async function loadLiveData() {
-    let { coins, global } = await fetchPair(API.markets, API.global);
+    let { coins, global, source } = await fetchPair(API.markets, API.global);
 
     if (!coins.length) {
       ({ coins, global } = await fetchPair(API.directMarkets, API.directGlobal));
+      source = "CoinGecko";
     }
 
     if (coins.length) {
       state.coins = coins;
       state.global = global && global.total_market_cap ? global : deriveGlobal(coins);
       state.source = "live";
+      state.sourceName = source || "CoinGecko";
       state.lastUpdated = new Date();
     } else {
       state.source = state.lastUpdated ? "live" : "demo";

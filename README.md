@@ -2,11 +2,15 @@
 
 A dark, mint-accented crypto market dashboard — **full stack**, no build step.
 
+**Live:** <https://duha-wzbp.onrender.com>
+
 - **Frontend:** static HTML/CSS/JS, custom design system, responsive down to 390px.
 - **Backend:** Node.js (24+), zero runtime dependencies, built-in `node:http`.
 - **Database:** SQLite via `node:sqlite` (file on disk, WAL mode).
-- **Live data:** CoinGecko, proxied and cached by the server. The browser never
-  hits CoinGecko directly unless the backend is unreachable.
+- **Live data:** CoinGecko first, with automatic fallback to CoinLore and
+  CoinPaprika when a provider is rate-limited or down. Responses are cached
+  server-side, so the browser never hits a provider directly unless the
+  backend itself is unreachable.
 
 ## Run locally
 
@@ -97,17 +101,28 @@ database is kept in the `duha-data` Docker volume. Update with
 
 ### 2. Render
 
-`render.yaml` is a Blueprint for a Node web service with the health check
-already configured.
+**Live now:** <https://duha-wzbp.onrender.com>
 
-1. Push this folder to a GitHub/GitLab repository.
-2. In Render: **New → Blueprint**, connect the repo, apply.
-3. Add a custom domain in the service settings and follow Render's DNS
-   instructions.
+The service is deployed from `xtang2843-cmd/duha` (branch `main`) with
+`scripts/render-deploy.js`. To redeploy after a push:
 
-**Persistence note:** the free plan has an ephemeral filesystem, so the SQLite
-database resets on every deploy. Attach a persistent disk (paid) and set
-`DATA_DIR` to the mount path, or swap SQLite for Postgres before launch.
+```bash
+node scripts/render-deploy.js
+```
+
+`render.yaml` documents the same settings as a Blueprint. To start from
+scratch, push the repo and use **New → Blueprint** in Render.
+
+**Free-plan notes:**
+
+- The service sleeps after ~15 minutes without traffic; the next visit waits
+  for a cold start.
+- The filesystem is ephemeral, so SQLite (watchlists + newsletter addresses)
+  resets on deploys and restarts. A watchlist also lives in the visitor's
+  browser, so it still survives locally. Attach a paid disk and set
+  `DATA_DIR` to the mount path for durable server-side storage.
+- Optional: set `COINGECKO_API_KEY` to a free CoinGecko demo key to raise the
+  primary provider's rate limit. The CoinLore fallback works without a key.
 
 ### 3. Fly.io
 

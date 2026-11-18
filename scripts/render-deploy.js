@@ -123,15 +123,15 @@ async function createService(owner) {
   });
 }
 
-async function getDeploy(deployId) {
-  return api(`/deploys/${deployId}`);
+async function getDeploy(serviceId, deployId) {
+  return api(`/services/${serviceId}/deploys/${deployId}`);
 }
 
-async function waitForDeploy(deployId, timeoutMs = 12 * 60 * 1000) {
+async function waitForDeploy(serviceId, deployId, timeoutMs = 12 * 60 * 1000) {
   const start = Date.now();
   let last = "";
   while (Date.now() - start < timeoutMs) {
-    const deploy = await getDeploy(deployId);
+    const deploy = await getDeploy(serviceId, deployId);
     const status = deploy && deploy.status ? deploy.status : "unknown";
     if (status !== last) {
       console.log(`Deploy status: ${status}`);
@@ -174,7 +174,7 @@ async function main() {
   }
 
   if (deployId) {
-    const deploy = await waitForDeploy(deployId);
+    const deploy = await waitForDeploy(service.id, deployId);
     console.log(`Deploy finished: ${deploy.status}`);
   }
 
