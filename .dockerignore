@@ -1,0 +1,9 @@
+data/
+node_modules/
+.git/
+.env
+.env.*
+!.env.example
+README.md
+*.log
+.DS_Store
