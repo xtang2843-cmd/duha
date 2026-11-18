@@ -10,6 +10,8 @@ data/
 # local configuration
 .env
 .env.local
+.render-api-key
+.render-token
 
 # OS / editor noise
 .DS_Store
